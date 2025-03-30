@@ -1,0 +1,79 @@
+name: Run Terraform Plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      port_payload:
+        required: true
+        description: "Port payload with details about the workflow entity"
+        type: string
+
+jobs:
+  terraform-plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set Up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Generate Port Access Token
+        id: generate-token
+        run: |
+          access_token=$(curl --location --request POST 'https://api.getport.io/v1/auth/access_token' \
+          --header 'Content-Type: application/json' \
+          --data-raw '{
+              "clientId": "'${{ secrets.PORT_CLIENT_ID }}'",
+              "clientSecret": "'${{ secrets.PORT_CLIENT_SECRET }}'"
+          }' | jq -r '.accessToken')
+          echo "ACCESS_TOKEN=$access_token" >> $GITHUB_ENV
+
+      - name: Parse Payload
+        id: parse
+        run: |
+          echo '${{ inputs.port_payload }}' > port_payload.json
+          RESOURCE_NAME=$(jq -r '.properties.resource_name' port_payload.json)
+          ENVIRONMENT=$(jq -r '.properties.environment' port_payload.json)
+          WORKFLOW_ID=$(jq -r '.identifier' port_payload.json)
+          
+          echo "RESOURCE_NAME=$RESOURCE_NAME" >> $GITHUB_ENV
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+          echo "WORKFLOW_ID=$WORKFLOW_ID" >> $GITHUB_ENV
+
+      - name: Prepare Terraform Files
+        run: |
+          mkdir -p infra
+          cat > infra/main.tf <<EOF
+          resource "null_resource" "${{ env.RESOURCE_NAME }}" {
+            triggers = {
+              environment = "${{ env.ENVIRONMENT }}"
+            }
+          }
+          EOF
+
+      - name: Terraform Init
+        run: terraform -chdir=infra init
+
+      - name: Terraform Plan
+        id: tfplan
+        run: |
+          terraform -chdir=infra plan -no-color | tee tfplan.out
+          PLAN_CONTENT=$(cat tfplan.out | base64 -w 0)
+          echo "ENCODED_PLAN=$PLAN_CONTENT" >> $GITHUB_ENV
+
+      - name: Update Workflow Entity with Plan
+        run: |
+          curl -s -X PATCH "https://api.getport.io/v1/blueprints/workflow/entities/${{ env.WORKFLOW_ID }}" \
+          -H "Authorization: Bearer ${{ env.ACCESS_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d @- <<EOF
+          {
+            "properties": {
+              "status": "planned",
+              "plan": "$(cat tfplan.out | jq -Rs .)"
+            }
+          }
+          EOF
